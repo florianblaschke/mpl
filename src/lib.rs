@@ -27,7 +27,10 @@ mod tests;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    hash::BuildHasher,
+};
 
 pub use errors::ParseError;
 use miette::{Diagnostic, SourceOffset, SourceSpan};
@@ -38,7 +41,7 @@ pub use query::Query;
 pub use stdlib::STDLIB;
 
 use crate::{
-    query::{Cmp, Filter, ParamDeclaration, TagType, TerminalParamType},
+    query::{Cmp, Filter, ParamDeclaration, ParamType, TagType, TerminalParamType, Warnings},
     types::{Dataset, Parameterized},
     visitor::{QueryVisitor, QueryWalker, VisitRes},
 };
@@ -67,10 +70,13 @@ pub enum CompileError {
 
 /// Parses and typechecks an MPL query into a Query object.
 #[allow(clippy::result_large_err)]
-pub fn compile(query: &str) -> Result<Query, CompileError> {
+pub fn compile<S: BuildHasher>(
+    query: &str,
+    system_params: HashMap<String, ParamType, S>,
+) -> Result<(Query, Warnings), CompileError> {
     // stage 1: parse
     let mut parse = MPLParser::parse(Rule::file, query).map_err(ParseError::from)?;
-    let mut query = parser::Parser::default().parse_query(&mut parse)?;
+    let (mut query, warnings) = parser::Parser::default().parse_query(&mut parse, system_params)?;
     // stage 2: typecheck
     let mut visitor = ParamTypecheckVisitor {};
     visitor.walk(&mut query)?;
@@ -81,7 +87,7 @@ pub fn compile(query: &str) -> Result<Query, CompileError> {
     let mut visitor = OptionCheckVisitor::default();
     visitor.walk(&mut query)?;
 
-    Ok(query)
+    Ok((query, warnings))
 }
 /// Type error
 #[derive(Debug, thiserror::Error, Diagnostic)]

@@ -1,6 +1,7 @@
 //! The query structures
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Display,
     num::TryFromIntError,
 };
 
@@ -105,6 +106,11 @@ pub struct Source {
     pub metric_id: MetricId,
     /// The time range
     pub time: Option<TimeRange>,
+}
+impl Source {
+    fn time(&self) -> Option<&TimeRange> {
+        self.time.as_ref()
+    }
 }
 
 /// An error related to value parsing
@@ -567,11 +573,65 @@ pub enum ParseProvidedParamsError {
     #[error("The number of params provided exceeds the upper limit of {0}")]
     TooManyParamsProvided(usize),
 }
+/// List of warning reasons
+#[derive(Debug)]
+pub enum WarningReason {
+    /// Provided but not declared  param
+    ParamNotDeclared(Vec<String>),
+    /// System parameter declared
+    ParamUsingSystemPrefix {
+        /// The param
+        param: String,
+    },
+    /// lowercase duration
+    OldDuration,
+}
+
+impl Display for WarningReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WarningReason::ParamNotDeclared(items) => write!(
+                f,
+                "These params were provided but not declared: {}",
+                items.join(", ")
+            ),
+            WarningReason::OldDuration => {
+                write!(f, "`duration` is depricated, please ues `Duration`")
+            }
+            WarningReason::ParamUsingSystemPrefix { param } => {
+                write!(
+                    f,
+                    "The param ${param} uses the `__` prefix reserved for system params"
+                )
+            }
+        }
+    }
+}
+
+/// Warning we want to surface to the user instead of failing the request.
+#[derive(Debug)]
+pub struct Warning {
+    source: Option<SourceSpan>,
+    warning: WarningReason,
+}
+
+impl Warning {
+    /// The warning message
+    #[must_use]
+    pub fn warning(&self) -> &WarningReason {
+        &self.warning
+    }
+    /// The location of the warning (if any)
+    #[must_use]
+    pub fn source(&self) -> Option<SourceSpan> {
+        self.source
+    }
+}
 
 /// Warnings we want to surface to the user instead of failing the request.
 #[derive(Debug, Default)]
 pub struct Warnings {
-    inner: Vec<String>,
+    inner: Vec<Warning>,
 }
 
 impl Warnings {
@@ -582,8 +642,18 @@ impl Warnings {
     }
 
     /// Add a new warning.
-    pub fn push(&mut self, warning: impl Into<String>) {
-        self.inner.push(warning.into());
+    pub fn push(&mut self, warning: WarningReason) {
+        self.inner.push(Warning {
+            source: None,
+            warning,
+        });
+    }
+    /// Add a new warning.
+    pub fn push_span(&mut self, span: SourceSpan, warning: WarningReason) {
+        self.inner.push(Warning {
+            source: Some(span),
+            warning,
+        });
     }
 
     /// Returns true if there are no warnings.
@@ -594,13 +664,13 @@ impl Warnings {
 
     /// Get the warnings as slice.
     #[must_use]
-    pub fn as_slice(&self) -> &[String] {
+    pub fn as_slice(&self) -> &[Warning] {
         &self.inner
     }
 
     /// Turn into a vector.
     #[must_use]
-    pub fn into_vec(self) -> Vec<String> {
+    pub fn into_vec(self) -> Vec<Warning> {
         self.inner
     }
 }
@@ -698,10 +768,7 @@ impl ProvidedParams {
             items.sort();
 
             // add to warnings, no need to error
-            warnings.push(format!(
-                "These params were provided but not declared: {}",
-                items.join(", ")
-            ));
+            warnings.push(WarningReason::ParamNotDeclared(items));
         }
 
         if !defined_more_than_once.is_empty() {
@@ -916,6 +983,14 @@ pub enum Query {
 }
 
 impl Query {
+    /// Gets the time range for the query
+    #[must_use]
+    pub fn time_range(&self) -> Option<&TimeRange> {
+        match self {
+            Query::Simple { source, .. } => source.time(),
+            Query::Compute { left, .. } => left.time_range(),
+        }
+    }
     /// Get a ref to the params of the query.
     #[must_use]
     pub fn params(&self) -> &Params {
