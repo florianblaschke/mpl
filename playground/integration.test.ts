@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { StepOutput, Series } from "@axiomhq/mpl-playground";
 import { Interpreter } from "@axiomhq/mpl-playground";
 import { datasets } from "./datasets";
+import { substituteSystemParams } from "./editor";
 
 const interp = new Interpreter(datasets);
 
@@ -314,6 +315,58 @@ describe("parse + interpret end-to-end", () => {
       const source = ok(result[0]);
       const afterIfdef = ok(result[1]);
       expect(afterIfdef.length).toBe(source.length);
+    });
+  });
+
+  describe("system params", () => {
+    // The whole point of the playground's `substituteSystemParams` helper
+    // is that the interpreter — which has no binding step — receives a
+    // query with `$__interval` already resolved. These tests exercise the
+    // same pipeline `main.ts` runs on every editor change, so a regression
+    // that breaks the live preview shows up here first.
+    it("resolves $__interval before the interpreter sees it", () => {
+      const doc = "test:http_requests_total | align to $__interval using avg";
+      const resolved = substituteSystemParams(doc);
+      const result = run(resolved);
+      expect(result.length).toBe(2);
+      const aligned = ok(result[1]);
+      expect(aligned.length).toBeGreaterThan(0);
+    });
+
+    it("runs without errors through a bucket step using $__interval", () => {
+      const doc =
+        "test:http_requests_total | bucket to $__interval using histogram(0.5, 0.95)";
+      const result = run(substituteSystemParams(doc));
+      // Source + bucket = 2 steps; both must produce series, neither errors.
+      expect(result.length).toBe(2);
+      ok(result[0]);
+      ok(result[1]);
+    });
+
+    // Pins the user-reported failure: prom::rate at 1m on data sampled at
+    // 1m cadence, then grouped, used to bail with "No valid points at
+    // column N for Sum". The fix has two parts that this test exercises
+    // together — trailing-window rate + group tolerance for all-NaN
+    // columns — so a regression in either would fail this case.
+    it("runs prom::rate + group by end-to-end at $__interval cadence", () => {
+      const doc = `\`dev.metrics\`:http_requests_total
+| filter path == #/.*(elastic\\/_bulk|ingest|(?:v1\\/(traces|logs|metrics))).*/
+| filter code == #/[123]../
+| align to $__interval using prom::rate
+| group by method, path, code using sum`;
+      const result = run(substituteSystemParams(doc));
+      for (const step of result) {
+        if ("Err" in step.result) {
+          throw new Error(`step "${step.text}" failed: ${step.result.Err}`);
+        }
+      }
+      // The final grouped series must carry at least one finite value;
+      // an all-NaN result would mean the chart panel renders blank.
+      const last = result[result.length - 1];
+      const series = ok(last);
+      expect(series.length).toBeGreaterThan(0);
+      const finite = series[0].values.filter(v => Number.isFinite(v)).length;
+      expect(finite).toBeGreaterThan(0);
     });
   });
 });
