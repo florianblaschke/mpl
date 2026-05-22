@@ -53,6 +53,8 @@ pub enum StepNode {
         param: ParamDeclaration,
         /// The filter applied when the param is set.
         filter: Filter,
+        /// The filter applied when the param is not set.
+        else_filter: Option<Filter>,
     },
     /// An aggregate pipe.
     Aggregate(Aggregate),
@@ -78,8 +80,20 @@ impl Display for StepNode {
         match self {
             StepNode::Source(s) => write!(f, "{s}"),
             StepNode::Filter(fl) => write!(f, "| where {fl}"),
-            StepNode::Ifdef { param, filter } => {
-                write!(f, "| ifdef(${}) {{ where {filter} }}", param.name)
+            StepNode::Ifdef {
+                param,
+                filter,
+                else_filter,
+            } => {
+                if let Some(else_filter) = else_filter {
+                    write!(
+                        f,
+                        "| ifdef(${}) {{ where {filter} }} else {{ where {else_filter} }}",
+                        param.name
+                    )
+                } else {
+                    write!(f, "| ifdef(${}) {{ where {filter} }}", param.name)
+                }
             }
             StepNode::Aggregate(a) => write!(f, "{a}"),
             StepNode::Sample(v) => write!(f, "| sample {v}"),
@@ -239,7 +253,15 @@ fn query_steps(query: Query) -> Vec<PipeStep> {
             }
             steps.extend(filters.into_iter().map(|fi| match fi {
                 FilterOrIfDef::Filter(filter) => step(StepNode::Filter(filter)),
-                FilterOrIfDef::Ifdef { param, filter } => step(StepNode::Ifdef { param, filter }),
+                FilterOrIfDef::Ifdef {
+                    param,
+                    filter,
+                    else_filter,
+                } => step(StepNode::Ifdef {
+                    param,
+                    filter,
+                    else_filter,
+                }),
             }));
             steps.extend(
                 aggregates
@@ -283,8 +305,17 @@ pub fn interpret(pipe_steps: &[PipeStep], datasets: &Datasets) -> Vec<Result<Vec
             StepNode::Source(src) => eval_source(src, datasets),
             StepNode::Filter(f) => apply_filter(&series, f),
             // The playground has no way to provide values for optional params,
-            // so the gated filter never applies and the series passes through.
-            StepNode::Ifdef { .. } => Ok(series.clone()),
+            // so the gate never opens: the if-branch never fires. When the
+            // query supplies an `else { ... }`, that branch *does* fire (it's
+            // exactly the "param unbound" case), so apply its filter. With no
+            // else branch the series passes through unchanged.
+            StepNode::Ifdef {
+                else_filter: Some(f),
+                ..
+            } => apply_filter(&series, f),
+            StepNode::Ifdef {
+                else_filter: None, ..
+            } => Ok(series.clone()),
             StepNode::Sample(rate) => apply_sample(&series, *rate),
             StepNode::Error(msg) => Err(eyre!("{msg}")),
             StepNode::Aggregate(agg) => apply_aggregate(&series, agg),

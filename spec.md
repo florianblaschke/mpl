@@ -169,13 +169,17 @@ Data transformations are done using the `map` operator. The syntax for the map f
 
 ### Aggregation
 
-Aggregation is a transformation that aggregates the data over a given time to a single value. This is done using the `align` operator. The operator also aligns the data to the given window.
+Aggregation is a transformation that aggregates the data over a given time to a single value. This is done using the `align` operator. The operator also aligns the data to the given window. The `to <window>` can be omitted to calculate the aggregation over all values in the timerange.
 
 The syntax for the align is as follows:
 
 ```mpl
 // calculates the average over 5 minutes
 | align to 5m using avg
+
+// calculates the average over all values in the timerange
+| align using avg
+
 
 // counts the datapoints in the last hour
 | align to 1h using count
@@ -215,6 +219,13 @@ The syntax for the bucket is as follows:
 ```mpl
 // Buckets over project and namespace using histogram(count)
 | bucket by project, namespace to 5m using histogram(count)
+```
+
+Similarly to `group` and `align`, the `to <window>` can be omitted to calculate the bucket over all values in the timerange and she `by` can be omitted to bucket over all tags.
+
+```mpl
+// Buckets all tags and the whole timerange using histogram(count)
+| bucket using histogram(count)
 ```
 
 ### Renaming
@@ -561,9 +572,11 @@ is well-formed regardless of whether the caller supplied the parameter.
 `ifdef` conditionally applies a filter when an optional parameter is supplied. If the
 gating parameter is omitted from the request, the entire `ifdef` block is skipped; if it
 is supplied, the inner `where` clause is applied like any other filter.
+a `else` branch can be added to the `ifdef` block to apply a different filter when the
+gating parameter is not supplied.
 
 ```mpl
-| ifdef($param) { where <filter-expr> }
+| ifdef($param) { where <filter-expr> } else { where <else-filter-expr> }
 ```
 
 The argument to `ifdef` must be a parameter declared with an `Option<…>` type. Inside the
