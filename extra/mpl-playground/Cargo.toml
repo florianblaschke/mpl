@@ -12,7 +12,7 @@ rust-version = "1.92.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mpl-lang = { path = "../..", default-features = false, features = ["wasm"] }
+mpl-lang = { path = "../..", default-features = false }
 derive_more = { version = "2", features = ["deref"] }
 eyre = "0.6"
 miette = "7.6.0"

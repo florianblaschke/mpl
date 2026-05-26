@@ -6,7 +6,10 @@ export default defineConfig({
     alias: {
       // The real package is a WASM build artifact (gitignored). Tests that
       // exercise pure-JS logic don't call any WASM functions, so a stub suffices.
-      "@axiomhq/mpl": path.resolve(__dirname, "src/__mpl-lang-stub__.ts"),
+      "@axiomhq/mpl": path.resolve(
+        __dirname,
+        "src/__mpl-stub__.ts",
+      ),
     },
   },
 });

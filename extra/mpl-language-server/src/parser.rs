@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::wasm::Span;
+use crate::Span;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Type {
@@ -111,8 +111,8 @@ pub(crate) fn tokenize(src: &str) -> Vec<Token<'_>> {
                 let next = src.as_bytes().get(i + 1).copied();
                 // #/ starts a regex literal, #s/ starts a regex replace
                 let is_regex = next == Some(b'/');
-                let is_regex_replace = next == Some(b's')
-                    && src.as_bytes().get(i + 2).copied() == Some(b'/');
+                let is_regex_replace =
+                    next == Some(b's') && src.as_bytes().get(i + 2).copied() == Some(b'/');
                 if is_regex || is_regex_replace {
                     // skip past the opening delimiter (#/ or #s/)
                     i += if is_regex_replace { 3 } else { 2 };
@@ -163,7 +163,7 @@ pub(crate) fn tokenize(src: &str) -> Vec<Token<'_>> {
             b'+' | b'-' => {
                 tokens.push(Token {
                     typ: Type::Operator,
-                    value: std::str::from_utf8(&[*c]).unwrap(),
+                    value: &src[i..i + 1],
                     span: Span::new(i, i + 1),
                 });
                 i += 1;
@@ -303,11 +303,6 @@ pub(crate) fn tokenize(src: &str) -> Vec<Token<'_>> {
                         });
                     }
                 }
-                tokens.push(Token {
-                    typ: Type::Ident,
-                    value,
-                    span: Span::new(start, i),
-                });
             }
             b'=' => {
                 let Some(b) = src.as_bytes().get(i + 1) else {

@@ -50,7 +50,7 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked
       - name: Build WASM
-        run: wasm-pack build --out-name mpl --out-dir packages/mpl --scope axiomhq --target web --profile wasm-release --no-opt --features wasm 
+        run: ./packages/build-mpl-wasm.sh
       - name: Update mpl package.json
         run: |
           set -euo pipefail

@@ -1,7 +1,8 @@
 /**
  * Shared WASM types and utilities for the MPL language server integration.
  *
- * These types mirror the Rust serde output from `lib/mpl/src/wasm/completions.rs`.
+ * These types mirror the Rust serde output from the
+ * `mpl-language-server-wasm` crate (published on npm as `@axiomhq/mpl`).
  * Centralised here to avoid duplication across mpl-completions, mpl-hover,
  * and mpl-signature-help.
  */

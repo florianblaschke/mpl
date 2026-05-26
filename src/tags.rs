@@ -13,8 +13,6 @@ use crate::{query::TagType, types::StrumbraError};
 #[derive(Clone, PartialEq, serde::Deserialize, serde::Serialize, Default)]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
 #[serde(untagged)]
-#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub enum TagValue {
     #[default]
     /// Null value
@@ -26,11 +24,7 @@ pub enum TagValue {
     /// Float value
     Float(f64),
     /// String value
-    String(
-        #[cfg_attr(feature = "wasm", tsify(type = "String"))]
-        #[cfg_attr(feature = "bincode", bincode(with_serde))]
-        SharedString,
-    ),
+    String(#[cfg_attr(feature = "bincode", bincode(with_serde))] SharedString),
 }
 impl TagValue {
     /// Returns the type of the tag value.
