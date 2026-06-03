@@ -144,6 +144,108 @@ fn filter_eq() {
     assert_eq!(result[1].as_ref().unwrap()[0].values, vec![1.0]);
 }
 
+/// End-to-end through the real `run()` path: an interpolated string in a query
+/// *string* is parsed, planned, and evaluated — it must NOT report
+/// "String values are not supported".
+#[test]
+fn run_path_interpolated_string_filter() {
+    let datasets = ds(
+        "ds",
+        "m",
+        vec![
+            s(&[("host", "v1")], vec![0.0], vec![1.0]),
+            s(&[("host", "v2")], vec![0.0], vec![2.0]),
+        ],
+    );
+    let (query, _) = compile("ds:m | where host == \"v${ 1 }\"", HashMap::new())
+        .expect("query with interpolation must compile");
+    let steps = query_steps(query);
+    let results = interpret(&steps, &datasets);
+    let filtered = results
+        .last()
+        .expect("a filter step")
+        .as_ref()
+        .unwrap_or_else(|e| panic!("interpolated filter must evaluate, got error: {e:#}"));
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].values, vec![1.0]);
+}
+
+/// A constant string interpolation (`host == "v${ 1 }"`) is folded and matched.
+#[test]
+fn filter_eq_constant_interpolation() {
+    let datasets = ds(
+        "ds",
+        "m",
+        vec![
+            s(&[("host", "v1")], vec![0.0], vec![1.0]),
+            s(&[("host", "v2")], vec![0.0], vec![2.0]),
+        ],
+    );
+    let filter = Filter::Cmp {
+        field: "host".into(),
+        rhs: Cmp::Eq(Expr::String(vec![
+            StringFragment::Text("v".into()),
+            StringFragment::Expr(Expr::Const(TagValue::Int(1))),
+        ])),
+    };
+    let steps = vec![step(source_node("ds", "m")), step(StepNode::Filter(filter))];
+    let result = interpret(&steps, &datasets);
+    let kept = result[1]
+        .as_ref()
+        .expect("interpolated filter must evaluate");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].values, vec![1.0]);
+}
+
+/// Nested constant interpolation folds recursively (`"a${ "b${ 2 }" }"`).
+#[test]
+fn filter_eq_nested_interpolation() {
+    let datasets = ds("ds", "m", vec![s(&[("host", "ab2")], vec![0.0], vec![1.0])]);
+    let filter = Filter::Cmp {
+        field: "host".into(),
+        rhs: Cmp::Eq(Expr::String(vec![
+            StringFragment::Text("a".into()),
+            StringFragment::Expr(Expr::String(vec![
+                StringFragment::Text("b".into()),
+                StringFragment::Expr(Expr::Const(TagValue::Int(2))),
+            ])),
+        ])),
+    };
+    let steps = vec![step(source_node("ds", "m")), step(StepNode::Filter(filter))];
+    let result = interpret(&steps, &datasets);
+    assert_eq!(result[1].as_ref().expect("nested interp").len(), 1);
+}
+
+/// A param embedded in an interpolation cannot be resolved in the playground,
+/// so it is rejected — and the message reflects the param, not "strings".
+#[test]
+fn filter_eq_param_interpolation_rejected() {
+    let datasets = ds("ds", "m", vec![s(&[("host", "x")], vec![0.0], vec![1.0])]);
+    let filter = Filter::Cmp {
+        field: "host".into(),
+        rhs: Cmp::Eq(Expr::String(vec![
+            StringFragment::Text("p".into()),
+            StringFragment::Expr(Expr::Param {
+                span: span(),
+                param: ParamDeclaration {
+                    span: span(),
+                    name: "p".into(),
+                    typ: ParamType::Terminal(TerminalParamType::Tag(TagType::String)),
+                },
+            }),
+        ])),
+    };
+    let steps = vec![step(source_node("ds", "m")), step(StepNode::Filter(filter))];
+    let result = interpret(&steps, &datasets);
+    let err = result[1]
+        .as_ref()
+        .expect_err("param interpolation must fail");
+    assert!(
+        err.to_string().contains("Parameterized"),
+        "expected a param error, got: {err}"
+    );
+}
+
 #[test]
 fn filter_regex() {
     let datasets = ds(
@@ -1620,6 +1722,28 @@ fn extend_supports_multiple_tags() {
     );
 }
 
+/// A constant interpolation on the RHS of `extend` is folded into the value.
+#[test]
+fn extend_constant_interpolation() {
+    let datasets = ds("ds", "m", vec![s(&[("host", "a")], vec![0.0], vec![1.0])]);
+    let steps = vec![
+        step(source_node("ds", "m")),
+        step(StepNode::Extend(vec![TagExtend {
+            tag: "url".into(),
+            value: Expr::String(vec![
+                StringFragment::Text("port-".into()),
+                StringFragment::Expr(Expr::Const(TagValue::Int(8080))),
+            ]),
+        }])),
+    ];
+    let result = interpret(&steps, &datasets);
+    let extended = result[1].as_ref().expect("extend must succeed");
+    assert_eq!(
+        extended[0].tags.get("url").map(String::as_str),
+        Some("port-8080")
+    );
+}
+
 /// ADR-0006 invariant: extending a tag that already exists on any series
 /// is an error. The playground enforces this at interpret time so users
 /// see the failure mode in the editor.
@@ -1638,6 +1762,191 @@ fn extend_rejects_conflicting_tag() {
     assert!(
         err.to_string().contains("host"),
         "error must name the conflicting tag, got: {err}"
+    );
+}
+
+// ── tag references in expressions ───────────────────────────────────────────
+
+/// `where lhs == rhs_tag` keeps only series where both tags exist and are equal.
+#[test]
+fn filter_eq_tag_ref_matches_equal_series() {
+    let datasets = ds(
+        "ds",
+        "m",
+        vec![
+            s(&[("a", "x"), ("b", "x")], vec![0.0], vec![1.0]),
+            s(&[("a", "x"), ("b", "y")], vec![0.0], vec![2.0]),
+        ],
+    );
+    let filter = Filter::Cmp {
+        field: "a".into(),
+        rhs: Cmp::Eq(Expr::Tag("b".into())),
+    };
+    let steps = vec![step(source_node("ds", "m")), step(StepNode::Filter(filter))];
+    let result = interpret(&steps, &datasets);
+    let filtered = result[1].as_ref().expect("filter must succeed");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].tags.get("b").map(String::as_str), Some("x"));
+}
+
+/// A series missing the referenced RHS tag is a non-match (not an error),
+/// as long as some other series carries it.
+#[test]
+fn filter_tag_ref_missing_on_series_is_non_match() {
+    let datasets = ds(
+        "ds",
+        "m",
+        vec![
+            s(&[("a", "x"), ("b", "x")], vec![0.0], vec![1.0]),
+            // No `b` tag here: the comparison cannot be evaluated → non-match.
+            s(&[("a", "x")], vec![0.0], vec![2.0]),
+        ],
+    );
+    let filter = Filter::Cmp {
+        field: "a".into(),
+        rhs: Cmp::Eq(Expr::Tag("b".into())),
+    };
+    let steps = vec![step(source_node("ds", "m")), step(StepNode::Filter(filter))];
+    let result = interpret(&steps, &datasets);
+    let filtered = result[1].as_ref().expect("filter must succeed");
+    assert_eq!(filtered.len(), 1);
+}
+
+/// `!=` against a missing RHS tag must NOT match (the comparison is undefined).
+#[test]
+fn filter_ne_tag_ref_missing_is_non_match() {
+    let datasets = ds("ds", "m", vec![s(&[("a", "x")], vec![0.0], vec![1.0])]);
+    let filter = Filter::Cmp {
+        field: "a".into(),
+        rhs: Cmp::Ne(Expr::Tag("b".into())),
+    };
+    let steps = vec![step(source_node("ds", "m")), step(StepNode::Filter(filter))];
+    let result = interpret(&steps, &datasets);
+    // `b` is absent from ALL series → "Unknown tag" guard fires.
+    let err = result[1].as_ref().expect_err("absent-everywhere must fail");
+    assert!(err.to_string().contains('b'), "got: {err}");
+}
+
+/// A RHS tag reference absent from every series triggers the unknown-tag guard.
+#[test]
+fn filter_tag_ref_unknown_everywhere_errors() {
+    let datasets = ds("ds", "m", vec![s(&[("a", "x")], vec![0.0], vec![1.0])]);
+    let filter = Filter::Cmp {
+        field: "a".into(),
+        rhs: Cmp::Eq(Expr::Tag("nope".into())),
+    };
+    let steps = vec![step(source_node("ds", "m")), step(StepNode::Filter(filter))];
+    let result = interpret(&steps, &datasets);
+    let err = result[1].as_ref().expect_err("unknown tag must fail");
+    assert!(err.to_string().contains("nope"), "got: {err}");
+}
+
+/// Numeric comparison resolves the RHS tag's value before comparing as floats.
+#[test]
+fn filter_gt_tag_ref_numeric() {
+    let datasets = ds(
+        "ds",
+        "m",
+        vec![
+            s(&[("val", "10"), ("limit", "5")], vec![0.0], vec![1.0]),
+            s(&[("val", "3"), ("limit", "5")], vec![0.0], vec![2.0]),
+        ],
+    );
+    let filter = Filter::Cmp {
+        field: "val".into(),
+        rhs: Cmp::Gt(Expr::Tag("limit".into())),
+    };
+    let steps = vec![step(source_node("ds", "m")), step(StepNode::Filter(filter))];
+    let result = interpret(&steps, &datasets);
+    let filtered = result[1].as_ref().expect("filter must succeed");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].tags.get("val").map(String::as_str), Some("10"));
+}
+
+/// `extend new = existing_tag` copies each series' own tag value (per-series).
+#[test]
+fn extend_tag_ref_per_series() {
+    let datasets = ds(
+        "ds",
+        "m",
+        vec![
+            s(&[("host", "a")], vec![0.0], vec![1.0]),
+            s(&[("host", "b")], vec![0.0], vec![2.0]),
+        ],
+    );
+    let steps = vec![
+        step(source_node("ds", "m")),
+        step(StepNode::Extend(vec![TagExtend {
+            tag: "alias".into(),
+            value: Expr::Tag("host".into()),
+        }])),
+    ];
+    let result = interpret(&steps, &datasets);
+    let extended = result[1].as_ref().expect("extend must succeed");
+    let mut aliases: Vec<&str> = extended
+        .iter()
+        .map(|s| s.tags.get("alias").map_or("", String::as_str))
+        .collect();
+    aliases.sort_unstable();
+    assert_eq!(aliases, vec!["a", "b"]);
+}
+
+/// Extend referencing a tag missing on a series errors (must yield a value).
+#[test]
+fn extend_tag_ref_missing_errors() {
+    let datasets = ds("ds", "m", vec![s(&[("host", "a")], vec![0.0], vec![1.0])]);
+    let steps = vec![
+        step(source_node("ds", "m")),
+        step(StepNode::Extend(vec![TagExtend {
+            tag: "alias".into(),
+            value: Expr::Tag("missing".into()),
+        }])),
+    ];
+    let result = interpret(&steps, &datasets);
+    let err = result[1].as_ref().expect_err("missing tag must fail");
+    assert!(err.to_string().contains("missing"), "got: {err}");
+}
+
+/// An interpolation referencing a missing tag errors (the value is undefined).
+#[test]
+fn extend_interpolation_missing_tag_errors() {
+    let datasets = ds("ds", "m", vec![s(&[("host", "a")], vec![0.0], vec![1.0])]);
+    let steps = vec![
+        step(source_node("ds", "m")),
+        step(StepNode::Extend(vec![TagExtend {
+            tag: "url".into(),
+            value: Expr::String(vec![
+                StringFragment::Text("host-".into()),
+                StringFragment::Expr(Expr::Tag("missing".into())),
+            ]),
+        }])),
+    ];
+    let result = interpret(&steps, &datasets);
+    let err = result[1]
+        .as_ref()
+        .expect_err("missing interpolated tag must fail");
+    assert!(err.to_string().contains("missing"), "got: {err}");
+}
+
+/// A tag reference embedded in a string interpolation is resolved per-series.
+#[test]
+fn extend_tag_ref_interpolation() {
+    let datasets = ds("ds", "m", vec![s(&[("host", "a")], vec![0.0], vec![1.0])]);
+    let steps = vec![
+        step(source_node("ds", "m")),
+        step(StepNode::Extend(vec![TagExtend {
+            tag: "url".into(),
+            value: Expr::String(vec![
+                StringFragment::Text("host-".into()),
+                StringFragment::Expr(Expr::Tag("host".into())),
+            ]),
+        }])),
+    ];
+    let result = interpret(&steps, &datasets);
+    let extended = result[1].as_ref().expect("extend must succeed");
+    assert_eq!(
+        extended[0].tags.get("url").map(String::as_str),
+        Some("host-a")
     );
 }
 

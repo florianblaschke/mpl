@@ -440,22 +440,19 @@ fn is_compute_paren(bytes: &[u8], pos: usize) -> bool {
 /// Finds the byte offset of the first `//` on a line that is not inside a
 /// string or backtick-escaped identifier.
 fn find_line_comment(line: &[u8]) -> Option<usize> {
+    let len = line.len();
     let mut i = 0;
-    while i + 1 < line.len() {
+    while i + 1 < len {
         match line[i] {
-            b'"' | b'`' => {
-                let delim = line[i];
-                i += 1;
-                while i < line.len() && line[i] != delim {
-                    if line[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                if i < line.len() {
+            // Interpolation-aware so a `//` inside a nested string (e.g.
+            // `"a ${ "b // c" }"`) is not mistaken for a comment.
+            b'"' => {
+                skip_string_literal(line, len, &mut i);
+                if i < len {
                     i += 1;
                 }
             }
+            b'`' => skip_backtick(line, len, &mut i),
             b'/' if line[i + 1] == b'/' => return Some(i),
             _ => i += 1,
         }
@@ -560,13 +557,19 @@ fn count_pipes(text: &str) -> usize {
 #[cfg(test)]
 pub fn compute_completions(query: &str, cursor_pos: usize) -> Option<CompletionResult> {
     compute_completions_with_params(query, cursor_pos, &[])
+        .into_iter()
+        .next()
 }
 
+/// Returns every completion result applicable at `cursor_pos`. Most positions
+/// yield a single result; an empty `expr` position yields both a `Params` and
+/// a `Tag` result so the editor can offer params and tags simultaneously and
+/// let its own prefix filter separate them. An empty `Vec` means no completion.
 pub fn compute_completions_with_params(
     query: &str,
     cursor_pos: usize,
     extra_params: &[ParamItem],
-) -> Option<CompletionResult> {
+) -> Vec<CompletionResult> {
     let cursor = cursor_pos.min(query.len());
     let (word_start, partial) = extract_partial_word(query, cursor);
     let before = &query[..word_start];
@@ -582,42 +585,66 @@ pub fn compute_completions_with_params(
     }
 
     let span = Span::new(word_start, cursor);
-    let mut result = match locate_query_context(before) {
-        QueryContext::Subquery(text) => {
-            suggest_for_context(text, span, FilterPolicy::Include, &params)
-                .or_else(|| suggest_for_preamble(text, partial, span))
-                .or_else(|| suggest_for_source(text, partial, span, &params))?
+    let mut results = match classify_string_context(query, word_start) {
+        StringContext::Interpolation => {
+            // Inside a `${ \u2026 }` string interpolation the grammar accepts an `expr`
+            // (`const | param_ident | ident`), so a tag reference or a param are
+            // both legal. A const literal (`42`, `"x"`) cannot be completed.
+            // `active_gate = None` excludes optional params (only valid inside an
+            // `ifdef` body); this is the safe direction the rest of the engine uses.
+            suggest_expr_position(before, span, partial, &params, None, |_| true)
         }
-        QueryContext::ComputeRulePipe(text) => suggest_for_compute_rule(text, span)?,
-        QueryContext::ComputeTailPipe(text) => {
-            suggest_for_context(text, span, FilterPolicy::Exclude, &params)?
-        }
+        // Inside plain string-literal text the user is typing a `const` value,
+        // not a tag or param, so nothing should be offered. (Without this guard
+        // the unterminated leading `"` is mis-read as a bare token and the
+        // dispatcher wrongly suggests boolean operators.)
+        StringContext::StringText => vec![],
+        StringContext::Code => match locate_query_context(before) {
+            QueryContext::Subquery(text) => {
+                let mut r =
+                    suggest_for_context(text, span, partial, FilterPolicy::Include, &params);
+                if r.is_empty() {
+                    r = suggest_for_preamble(text, partial, span);
+                }
+                if r.is_empty() {
+                    r = suggest_for_source(text, partial, span, &params);
+                }
+                r
+            }
+            QueryContext::ComputeRulePipe(text) => suggest_for_compute_rule(text, span),
+            QueryContext::ComputeTailPipe(text) => {
+                suggest_for_context(text, span, partial, FilterPolicy::Exclude, &params)
+            }
+        },
     };
 
     // For Tag completions where the user typed an opening backtick, advance
     // span.from past the backtick so the TS adapter can detect the backtick
     // context (doc.charAt(from - 1) === '`') and filter against bare tag names.
-    if partial.starts_with('`')
-        && let CompletionResult::Tag { ref mut span, .. } = result
-    {
-        span.from += 1;
+    for result in &mut results {
+        if partial.starts_with('`')
+            && let CompletionResult::Tag { span: tag_span, .. } = result
+        {
+            tag_span.from += 1;
+        }
+
+        // Strip a leading backtick from partial before filtering — the backtick is
+        // a delimiter, not part of the identifier the user is typing.
+        // For Params, the span may have been narrowed (e.g. to just the metric
+        // fragment `$m` in `ds:$m`), so derive the filter text from the span.
+        let filter_partial = match &*result {
+            CompletionResult::Params {
+                span: param_span, ..
+            } => &query[param_span.from..cursor],
+            _ => partial.strip_prefix('`').unwrap_or(partial),
+        };
+        if !filter_partial.is_empty() {
+            let lower = filter_partial.to_lowercase();
+            result.retain_options(|label| label.to_lowercase().starts_with(&lower));
+        }
     }
 
-    // Strip a leading backtick from partial before filtering — the backtick is
-    // a delimiter, not part of the identifier the user is typing.
-    // For Params, the span may have been narrowed (e.g. to just the metric
-    // fragment `$m` in `ds:$m`), so derive the filter text from the span.
-    let filter_partial = if let CompletionResult::Params { ref span, .. } = result {
-        &query[span.from..cursor]
-    } else {
-        partial.strip_prefix('`').unwrap_or(partial)
-    };
-    if !filter_partial.is_empty() {
-        let lower = filter_partial.to_lowercase();
-        result.retain_options(|label| label.to_lowercase().starts_with(&lower));
-    }
-
-    Some(result)
+    results
 }
 
 // ── text scanning utilities ─────────────────────────────────────
@@ -701,15 +728,173 @@ pub fn is_char_escaped(bytes: &[u8], pos: usize) -> bool {
 }
 
 /// Advances `i` past a literal (double-quoted string, backtick identifier,
+/// Skips a backtick-escaped identifier starting at `bytes[*i] == '`'`,
+/// leaving `*i` just past the closing backtick (or at `len` if unterminated).
+/// Handles `\`` escapes inside the identifier.
+fn skip_backtick(bytes: &[u8], len: usize, i: &mut usize) {
+    *i += 1;
+    while *i < len {
+        match bytes[*i] {
+            b'\\' => *i += 2,
+            b'`' => {
+                *i += 1;
+                return;
+            }
+            _ => *i += 1,
+        }
+    }
+}
+
+/// Skips a double-quoted string starting at `bytes[*i] == '"'`, descending
+/// through any `${ … }` interpolations (which may contain nested strings).
+/// On return `*i` is on the closing quote, or at `len` if the string is
+/// unterminated. Mirrors the `skip_literal` contract so callers `*i += 1` past
+/// the closing quote.
+fn skip_string_literal(bytes: &[u8], len: usize, i: &mut usize) {
+    *i += 1;
+    while *i < len {
+        match bytes[*i] {
+            b'\\' => *i += 2,
+            b'"' => return,
+            b'$' if *i + 1 < len && bytes[*i + 1] == b'{' => {
+                *i += 2;
+                skip_interpolation(bytes, len, i);
+            }
+            _ => *i += 1,
+        }
+    }
+    // Unterminated: clamp so the index stays within bounds.
+    if *i > len {
+        *i = len;
+    }
+}
+
+/// Skips the body of a `${ … }` interpolation; `*i` starts just past the
+/// opening `${` and ends just past the matching `}` (or at `len`). The
+/// interpolation expr is `param_ident | const`, so the only constructs that
+/// can hide a `}` are nested strings and backtick identifiers; bare brace
+/// nesting cannot occur.
+fn skip_interpolation(bytes: &[u8], len: usize, i: &mut usize) {
+    while *i < len {
+        match bytes[*i] {
+            b'}' => {
+                *i += 1;
+                return;
+            }
+            b'"' => {
+                skip_string_literal(bytes, len, i);
+                // Step past the nested closing quote (skip_string_literal
+                // leaves us on it). Guard against the unterminated case.
+                if *i < len {
+                    *i += 1;
+                }
+            }
+            b'`' => skip_backtick(bytes, len, i),
+            _ => *i += 1,
+        }
+    }
+}
+
+/// Returns `true` when byte offset `pos` lies inside a `${ … }` string
+/// interpolation, i.e. in interpolation "code" context where the grammar
+/// expects an `expr`. Plain string text and ordinary query code both return
+/// `false`. Used to offer param completions inside `${ }`.
+#[cfg(test)]
+fn cursor_in_interpolation(text: &str, pos: usize) -> bool {
+    matches!(
+        classify_string_context(text, pos),
+        StringContext::Interpolation
+    )
+}
+
+/// Where the cursor sits relative to string literals, which decides what (if
+/// anything) can be completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringContext {
+    /// Ordinary query code (outside any string literal).
+    Code,
+    /// Inside a `${ … }` interpolation, where the grammar expects an `expr`
+    /// (a param or tag reference).
+    Interpolation,
+    /// Inside plain string-literal text (a `const`), where nothing can be
+    /// completed — the user is typing a literal value, not a tag or param.
+    StringText,
+}
+
+/// Classifies the position at byte offset `pos` as ordinary code, the inside
+/// of a `${ … }` interpolation, or plain string-literal text.
+///
+/// Uses a context stack where `false` = code and `true` = string text. The
+/// base frame is top-level code; an interpolation pushes a code frame on top
+/// of a string frame, so being "in an interpolation" means the top frame is
+/// code while nested inside at least one string frame.
+fn classify_string_context(text: &str, pos: usize) -> StringContext {
+    let bytes = text.as_bytes();
+    let end = pos.min(bytes.len());
+    let mut stack = vec![false];
+    let mut i = 0;
+    while i < end {
+        let in_string = stack.last().copied().unwrap_or(false);
+        if in_string {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'"' => {
+                    stack.pop();
+                    i += 1;
+                }
+                b'$' if i + 1 < end && bytes[i + 1] == b'{' => {
+                    stack.push(false);
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        } else {
+            match bytes[i] {
+                b'"' => {
+                    stack.push(true);
+                    i += 1;
+                }
+                b'`' => skip_backtick(bytes, end, &mut i),
+                // Close the current interpolation; never pop the base frame.
+                b'}' if stack.len() > 1 => {
+                    stack.pop();
+                    i += 1;
+                }
+                b'/' if i + 1 < end && bytes[i + 1] == b'/' => {
+                    while i < end && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+    }
+    if stack.last().copied().unwrap_or(false) {
+        StringContext::StringText
+    } else if stack.len() > 1 {
+        StringContext::Interpolation
+    } else {
+        StringContext::Code
+    }
+}
+
 /// `//` line comment, `/regex/`, or `s/src/dst/` regex replace) if one starts
 /// at `bytes[i]`. After returning `true`, `i` points at the closing delimiter
 /// so the caller's `i += 1` skips past it.
 fn skip_literal(bytes: &[u8], len: usize, i: &mut usize) -> bool {
     match bytes[*i] {
-        b'"' | b'`' => {
-            let delim = bytes[*i];
+        // Strings may contain `${ \u2026 }` interpolations, which can themselves hold
+        // nested strings (and thus nested `${ }`). A naive "scan to the next
+        // quote" would stop at a nested string's opening quote, so use the
+        // interpolation-aware skipper. It leaves `*i` on the closing quote,
+        // matching the contract (the caller's `*i += 1` steps past it).
+        b'"' => {
+            skip_string_literal(bytes, len, i);
+            true
+        }
+        b'`' => {
             *i += 1;
-            while *i < len && bytes[*i] != delim {
+            while *i < len && bytes[*i] != b'`' {
                 if bytes[*i] == b'\\' {
                     *i += 1;
                 }
@@ -812,9 +997,17 @@ fn extract_source_info(text: &str) -> Option<(String, String)> {
         i += 1;
     }
 
-    let source = text[source_start..first_pipe].trim();
+    // Strip full-line `//` comments from the preamble: pest's `source` rule
+    // does not skip leading trivia, so a commented header — which every example
+    // query has — would otherwise make the parse fail and tag completion
+    // silently vanish.
+    let source: String = text[source_start..first_pipe]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    extract_source_via_parser(source)
+    extract_source_via_parser(source.trim())
 }
 
 /// Parses the source string using pest's `Rule::source` and extracts the
@@ -959,7 +1152,7 @@ fn suggest_params(
     params: &[ParamItem],
     active_gate: Option<&str>,
     allowed: impl Fn(ParamType) -> bool,
-) -> Option<CompletionResult> {
+) -> Vec<CompletionResult> {
     let options: Vec<ParamItem> = params
         .iter()
         .filter(|p| allowed(p.typ))
@@ -968,10 +1161,72 @@ fn suggest_params(
         .collect();
 
     if options.is_empty() {
-        None
+        vec![]
     } else {
-        Some(CompletionResult::Params { span, options })
+        vec![CompletionResult::Params { span, options }]
     }
+}
+
+/// Completions for a position that accepts an `expr` (`const | param_ident |
+/// ident`): filter comparison RHS, `extend` values, and string interpolation.
+///
+/// The completion API can only return one result kind, so route on what the
+/// user is typing:
+/// - `$…` → a param reference (params are always `$`-prefixed),
+/// - a string/numeric literal prefix (`"`, digit, `-`) → a `const`, which
+///   cannot be completed (return `None`),
+/// - a non-`$` identifier prefix (including a backtick-escaped one) → a tag
+///   reference, since it can never match a `$param`,
+/// - empty → prefer declared params (the richer, finite set, preserving the
+///   existing param UX) and fall back to tag completions when no param fits.
+///
+/// Tag completions need a resolvable dataset/metric; with none, only the
+/// param path can contribute.
+fn suggest_expr_position(
+    before: &str,
+    span: Span,
+    partial: &str,
+    params: &[ParamItem],
+    active_gate: Option<&str>,
+    allowed_params: impl Fn(ParamType) -> bool,
+) -> Vec<CompletionResult> {
+    // A `$`-prefixed word can only be a param; a tag could never match it.
+    if partial.starts_with('$') {
+        return suggest_params(span, params, active_gate, allowed_params);
+    }
+    // A literal prefix (`"`, digit, `-`) starts a `const`, which can't be completed.
+    if partial
+        .chars()
+        .next()
+        .is_some_and(|c| c == '"' || c == '-' || c.is_ascii_digit())
+    {
+        return vec![];
+    }
+    // A non-empty bare identifier can only be a tag reference (params are
+    // always `$`-prefixed, so they can never match it).
+    if !partial.is_empty() {
+        return extract_source_info(before)
+            .map(|(dataset, metric)| CompletionResult::Tag {
+                span,
+                dataset,
+                metric,
+            })
+            .into_iter()
+            .collect();
+    }
+    // Empty position: both a param reference and a tag reference are valid, so
+    // emit both and let the editor's prefix filter separate them. Params come
+    // first to preserve the historical single-result ordering for callers that
+    // only inspect the primary result.
+    let mut out = suggest_params(span, params, active_gate, allowed_params);
+    if let Some((dataset, metric)) = extract_source_info(before) {
+        out.push(CompletionResult::Tag {
+            span,
+            dataset,
+            metric,
+        });
+    }
+    out
 }
 
 // ── suggestion logic ────────────────────────────────────────────
@@ -1055,55 +1310,60 @@ fn pipe_keywords(
 
 /// Completions for the `compute_rule` pipe position (first pipe after `}`).
 /// Handles: `| compute <metric_name> using <compute_fn>`
-fn suggest_for_compute_rule(text: &str, span: Span) -> Option<CompletionResult> {
-    let pipe_pos = find_last_pipe(text)?;
+fn suggest_for_compute_rule(text: &str, span: Span) -> Vec<CompletionResult> {
+    let Some(pipe_pos) = find_last_pipe(text) else {
+        return vec![];
+    };
     let after_pipe = text[pipe_pos + 1..].trim();
 
     if after_pipe.is_empty() {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![KeywordItem {
                 label: "compute",
                 apply: Some("compute "),
                 info: "Compute a new metric from two sources",
             }],
-        });
+        }];
     }
 
     let words: Vec<&str> = after_pipe.split_whitespace().collect();
     match words[0] {
         "compute" => match words.len() {
-            1 => None,
-            2 => Some(CompletionResult::Keywords {
+            1 => vec![],
+            2 => vec![CompletionResult::Keywords {
                 span,
                 options: vec![KeywordItem {
                     label: "using",
                     apply: Some("using "),
                     info: "Specify the compute function",
                 }],
-            }),
+            }],
             _ => {
-                if *words.last()? == "using" {
-                    Some(CompletionResult::ComputeFunctions {
+                if words.last() == Some(&"using") {
+                    vec![CompletionResult::ComputeFunctions {
                         span,
                         options: COMPUTE_COMPLETIONS.clone(),
-                    })
+                    }]
                 } else {
-                    None
+                    vec![]
                 }
             }
         },
-        _ => None,
+        _ => vec![],
     }
 }
 
 fn suggest_for_context(
     before: &str,
     span: Span,
+    partial: &str,
     policy: FilterPolicy,
     params: &[ParamItem],
-) -> Option<CompletionResult> {
-    let pipe_pos = find_last_pipe(before)?;
+) -> Vec<CompletionResult> {
+    let Some(pipe_pos) = find_last_pipe(before) else {
+        return vec![];
+    };
     let after_pipe = before[pipe_pos + 1..].trim();
 
     // `sample` is only valid at the first pipe of a simple subquery
@@ -1111,12 +1371,12 @@ fn suggest_for_context(
     let has_optional_params = params.iter().any(|p| p.optional);
 
     if after_pipe.is_empty() {
-        return Some(pipe_keywords(
+        return vec![pipe_keywords(
             span,
             policy,
             allow_sample,
             has_optional_params,
-        ));
+        )];
     }
 
     let words: Vec<&str> = after_pipe.split_whitespace().collect();
@@ -1125,24 +1385,26 @@ fn suggest_for_context(
 
     match first {
         "where" | "filter" if policy == FilterPolicy::Include => {
-            suggest_filter_context(before, span, &words, last, params, None)
+            suggest_filter_context(before, span, partial, &words, last, params, None)
         }
         // `sample` takes a single numeric argument; no further completions
-        "sample" => None,
+        "sample" => vec![],
         f if f.starts_with("ifdef") && policy == FilterPolicy::Include => {
-            suggest_ifdef_context(before, span, after_pipe, params)
+            suggest_ifdef_context(before, span, partial, after_pipe, params)
         }
         "group"
             if words.len() >= 2 && words[1] == "by" && (last == "by" || last.ends_with(',')) =>
         {
-            let (dataset, metric) = extract_source_info(before)?;
-            Some(CompletionResult::Tag {
+            let Some((dataset, metric)) = extract_source_info(before) else {
+                return vec![];
+            };
+            vec![CompletionResult::Tag {
                 span,
                 dataset,
                 metric,
-            })
+            }]
         }
-        _ => suggest_pipe_rule(first, last, &words, span, params),
+        _ => suggest_pipe_rule(before, first, last, &words, span, partial, params),
     }
 }
 
@@ -1163,9 +1425,10 @@ fn suggest_for_context(
 fn suggest_ifdef_context(
     before: &str,
     span: Span,
+    partial: &str,
     after_pipe: &str,
     params: &[ParamItem],
-) -> Option<CompletionResult> {
+) -> Vec<CompletionResult> {
     let open_paren = after_pipe.find('(');
     let close_paren = after_pipe.rfind(')');
     // Use `find` (not `rfind`) so a `{` in the else-body doesn't masquerade
@@ -1180,17 +1443,19 @@ fn suggest_ifdef_context(
 
     // (b) `)` typed but no `{` yet — suggest opening the body
     if close_paren.is_some() && if_open_brace.is_none() {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![KeywordItem {
                 label: "{",
                 apply: Some("{ where "),
                 info: "Open the ifdef filter body",
             }],
-        });
+        }];
     }
 
-    let if_open = if_open_brace?;
+    let Some(if_open) = if_open_brace else {
+        return vec![];
+    };
     // Gate name (e.g. `"$f"`) scopes optional-param completions inside the
     // body to *this* ifdef's gate. Falling back to `None` when the argument
     // is malformed is intentional: with no gate, all optionals are filtered
@@ -1205,6 +1470,7 @@ fn suggest_ifdef_context(
         return suggest_inside_filter_body(
             before,
             span,
+            partial,
             after_pipe[if_open + 1..].trim(),
             params,
             active_gate,
@@ -1215,39 +1481,41 @@ fn suggest_ifdef_context(
 
     // (d) after if-body close, no `else` typed yet — suggest `else`
     if after_if.is_empty() {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![KeywordItem {
                 label: "else",
                 apply: Some("else { where "),
                 info: "Apply a different filter when the gating param is omitted",
             }],
-        });
+        }];
     }
 
     // The only valid continuation after the if-body is the `else` clause.
     // Anything else is a typo/in-progress edit we can't help with.
-    let after_else_kw = after_if.strip_prefix("else")?;
+    let Some(after_else_kw) = after_if.strip_prefix("else") else {
+        return vec![];
+    };
 
     // (e) `else` typed but no `{` yet — suggest opening the else body
     let Some(else_open_rel) = after_else_kw.find('{') else {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![KeywordItem {
                 label: "{",
                 apply: Some("{ where "),
                 info: "Open the else filter body",
             }],
-        });
+        }];
     };
 
     // (f) inside the else-body — bail once the user has typed the closing
     // `}` since the pipe-keywords logic on the next `|` takes over from there.
     let else_body = &after_else_kw[else_open_rel + 1..];
     if else_body.contains('}') {
-        return None;
+        return vec![];
     }
-    suggest_inside_filter_body(before, span, else_body.trim(), params, active_gate)
+    suggest_inside_filter_body(before, span, partial, else_body.trim(), params, active_gate)
 }
 
 /// Shared body of cases (c) and (f): cursor sits inside a `{ ... }` filter
@@ -1257,27 +1525,36 @@ fn suggest_ifdef_context(
 fn suggest_inside_filter_body(
     before: &str,
     span: Span,
+    partial: &str,
     body: &str,
     params: &[ParamItem],
     active_gate: Option<&str>,
-) -> Option<CompletionResult> {
+) -> Vec<CompletionResult> {
     if body.is_empty() {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![KeywordItem {
                 label: "where",
                 apply: Some("where "),
                 info: "Filter time series by label values",
             }],
-        });
+        }];
     }
     let body_words: Vec<&str> = body.split_whitespace().collect();
     let body_first = body_words[0];
     let body_last = body_words.last().copied().unwrap_or(body_first);
     if matches!(body_first, "where" | "filter") {
-        suggest_filter_context(before, span, &body_words, body_last, params, active_gate)
+        suggest_filter_context(
+            before,
+            span,
+            partial,
+            &body_words,
+            body_last,
+            params,
+            active_gate,
+        )
     } else {
-        None
+        vec![]
     }
 }
 
@@ -1297,31 +1574,33 @@ fn extract_ifdef_gate_name(after_pipe: &str, open_paren: usize) -> Option<&str> 
 }
 
 /// Returns the list of declared optional params, regardless of inner type.
-fn suggest_optional_params(span: Span, params: &[ParamItem]) -> Option<CompletionResult> {
+fn suggest_optional_params(span: Span, params: &[ParamItem]) -> Vec<CompletionResult> {
     let options: Vec<ParamItem> = params.iter().filter(|p| p.optional).cloned().collect();
     if options.is_empty() {
-        None
+        vec![]
     } else {
-        Some(CompletionResult::Params { span, options })
+        vec![CompletionResult::Params { span, options }]
     }
 }
 
 /// Shared logic for `pipe_rule` keyword completions (align/map/group/bucket/
 /// as). Used by both simple queries and compute outer tails.
 fn suggest_pipe_rule(
+    before: &str,
     first: &str,
     last: &str,
     words: &[&str],
     span: Span,
+    partial: &str,
     params: &[ParamItem],
-) -> Option<CompletionResult> {
+) -> Vec<CompletionResult> {
     match first {
         "align" => match last {
             "to" | "over" => suggest_params(span, params, None, |t| t == ParamType::Duration),
-            "using" => Some(CompletionResult::AlignFunctions {
+            "using" => vec![CompletionResult::AlignFunctions {
                 span,
                 options: ALIGN_COMPLETIONS.clone(),
-            }),
+            }],
             _ => {
                 let has_to = words.contains(&"to");
                 let has_over = words.contains(&"over");
@@ -1348,33 +1627,33 @@ fn suggest_pipe_rule(
                         info: "Specify the align function",
                     });
                 }
-                Some(CompletionResult::Keywords { span, options })
+                vec![CompletionResult::Keywords { span, options }]
             }
         },
         "map" => {
             if words.len() == 1 {
-                return Some(CompletionResult::MapFunctions {
+                return vec![CompletionResult::MapFunctions {
                     span,
                     options: MAP_COMPLETIONS.clone(),
-                });
+                }];
             }
-            None
+            vec![]
         }
         "group" => match last {
-            "by" => None,
-            "using" => Some(CompletionResult::GroupFunctions {
+            "by" => vec![],
+            "using" => vec![CompletionResult::GroupFunctions {
                 span,
                 options: GROUP_COMPLETIONS.clone(),
-            }),
-            _ if words.len() >= 2 && words[1] == "by" => Some(CompletionResult::Keywords {
+            }],
+            _ if words.len() >= 2 && words[1] == "by" => vec![CompletionResult::Keywords {
                 span,
                 options: vec![KeywordItem {
                     label: "using",
                     apply: Some("using "),
                     info: "Specify the group function",
                 }],
-            }),
-            _ => Some(CompletionResult::Keywords {
+            }],
+            _ => vec![CompletionResult::Keywords {
                 span,
                 options: vec![
                     KeywordItem {
@@ -1388,15 +1667,15 @@ fn suggest_pipe_rule(
                         info: "Specify the group function",
                     },
                 ],
-            }),
+            }],
         },
         "bucket" => suggest_bucket_pipe(words, last, span, params),
-        "as" => Some(CompletionResult::Keywords {
+        "as" => vec![CompletionResult::Keywords {
             span,
             options: vec![],
-        }),
-        "extend" => suggest_extend_pipe(words, last, span, params),
-        _ => None,
+        }],
+        "extend" => suggest_extend_pipe(before, words, last, span, partial, params),
+        _ => vec![],
     }
 }
 
@@ -1409,53 +1688,60 @@ fn suggest_pipe_rule(
 ///
 /// Cursor positions handled:
 ///   - `| extend foo `              → suggest `=`
-///   - `| extend foo = `            → suggest params (string/int/float/bool)
+///   - `| extend foo = `            → suggest tags/params (the value is an expr)
 ///   - `| extend foo = "x" `      → suggest `,` to continue, or no-op
 ///   - `| extend foo = "x", `     → free-form ident, no completions
 fn suggest_extend_pipe(
+    before: &str,
     words: &[&str],
     last: &str,
     span: Span,
+    partial: &str,
     params: &[ParamItem],
-) -> Option<CompletionResult> {
+) -> Vec<CompletionResult> {
     // `extend` alone or with a trailing comma waits for the user to type a
     // new tag name; we have no tag completions to offer for net-new tags.
     if words.len() == 1 || last.ends_with(',') {
-        return None;
+        return vec![];
     }
 
     // After a complete `extend ident = <value>` clause, suggest the comma
     // continuation. The value position is the last token whenever it is a
     // string/number/bool literal and the previous token was `=`.
     if words.len() >= 4 && words[words.len() - 2] == "=" && is_extend_value_literal(last) {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![KeywordItem {
                 label: ",",
                 apply: Some(", "),
                 info: "Add another tag",
             }],
-        });
+        }];
     }
 
-    // After `=` token — suggest declared params with scalar types.
+    // After `=` token the value is an `expr` (tag, param, or const literal).
     if last == "=" {
-        return suggest_extend_value_params(span, params);
+        return suggest_expr_position(before, span, partial, params, None, |typ| {
+            matches!(
+                typ,
+                ParamType::String | ParamType::Bool | ParamType::Int | ParamType::Float
+            )
+        });
     }
 
     // After a bare identifier (`| extend foo `) — suggest the `=` operator.
     if words.len() == 2 {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![KeywordItem {
                 label: "=",
                 apply: Some("= "),
                 info: "Assign a constant value to the new tag",
             }],
-        });
+        }];
     }
 
-    None
+    vec![]
 }
 
 /// Returns true when `tok` looks like a complete literal value
@@ -1477,33 +1763,23 @@ fn is_extend_value_literal(tok: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == 'E' || c == '+')
 }
 
-/// Params allowed on the RHS of an extend. Mirrors the predicate used by
-/// `suggest_filter_value_params` minus regex (regex is not a tag value).
-fn suggest_extend_value_params(span: Span, params: &[ParamItem]) -> Option<CompletionResult> {
-    suggest_params(span, params, None, |typ| {
-        matches!(
-            typ,
-            ParamType::String | ParamType::Bool | ParamType::Int | ParamType::Float
-        )
-    })
-}
-
 fn suggest_bucket_pipe(
     words: &[&str],
     last: &str,
     span: Span,
     params: &[ParamItem],
-) -> Option<CompletionResult> {
-    if let Some(result) = suggest_bucket_args(words, span) {
-        return Some(result);
+) -> Vec<CompletionResult> {
+    let args = suggest_bucket_args(words, span);
+    if !args.is_empty() {
+        return args;
     }
     match last {
-        "by" => None,
+        "by" => vec![],
         "to" => suggest_params(span, params, None, |t| t == ParamType::Duration),
-        "using" => Some(CompletionResult::BucketFunctions {
+        "using" => vec![CompletionResult::BucketFunctions {
             span,
             options: BUCKET_COMPLETIONS.clone(),
-        }),
+        }],
         _ => {
             let has_by = words.contains(&"by");
             let has_to = words.contains(&"to");
@@ -1532,7 +1808,7 @@ fn suggest_bucket_pipe(
                 });
             }
 
-            Some(CompletionResult::Keywords { span, options })
+            vec![CompletionResult::Keywords { span, options }]
         }
     }
 }
@@ -1552,7 +1828,7 @@ fn extract_enum_values(arg_type: &ArgType) -> Vec<&'static str> {
 /// Detects when the cursor is inside the parentheses of a bucket function
 /// call and returns argument completions derived from the function's
 /// `FunctionTrait::args()` metadata in the stdlib.
-fn suggest_bucket_args(words: &[&str], span: Span) -> Option<CompletionResult> {
+fn suggest_bucket_args(words: &[&str], span: Span) -> Vec<CompletionResult> {
     let joined: String = words.join(" ");
 
     // Find an unmatched open paren (depth > 0 at end of string)
@@ -1576,20 +1852,27 @@ fn suggest_bucket_args(words: &[&str], span: Span) -> Option<CompletionResult> {
         }
     }
 
-    let open = last_open?;
+    let Some(open) = last_open else {
+        return vec![];
+    };
 
     // Extract function name: identifier chars immediately before '('
     let before_paren = &joined[..open];
-    let fn_name = before_paren
+    let Some(fn_name) = before_paren
         .trim_end()
         .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty())
+    else {
+        return vec![];
+    };
 
-    let func = STDLIB.bucket_function(fn_name)?;
+    let Some(func) = STDLIB.bucket_function(fn_name) else {
+        return vec![];
+    };
     let args = func.args();
     if args.is_empty() {
-        return None;
+        return vec![];
     }
 
     let inside = &joined[open + 1..];
@@ -1604,16 +1887,16 @@ fn suggest_bucket_args(words: &[&str], span: Span) -> Option<CompletionResult> {
         if matches!(args[last].typ, ArgType::Repeated { .. }) {
             last
         } else {
-            return None;
+            return vec![];
         }
     };
 
     let values = extract_enum_values(&args[arg_idx].typ);
     if values.is_empty() {
-        return None;
+        return vec![];
     }
 
-    Some(CompletionResult::Keywords {
+    vec![CompletionResult::Keywords {
         span,
         options: values
             .into_iter()
@@ -1623,31 +1906,34 @@ fn suggest_bucket_args(words: &[&str], span: Span) -> Option<CompletionResult> {
                 info: "",
             })
             .collect(),
-    })
+    }]
 }
 
 fn suggest_filter_context(
     before: &str,
     span: Span,
+    partial: &str,
     words: &[&str],
     last: &str,
     params: &[ParamItem],
     active_gate: Option<&str>,
-) -> Option<CompletionResult> {
+) -> Vec<CompletionResult> {
     // Tag position: right after filter keyword, or after a boolean operator
     // NOTE: "not" and "(" overlap as logical grouping operators; both
     // trigger tag suggestions. A richer API would be needed to suggest
     // both boolean operators and tags simultaneously at the same position.
     if words.len() == 1 || matches!(last, "and" | "or" | "not" | "(") {
-        let (dataset, metric) = extract_source_info(before)?;
-        Some(CompletionResult::Tag {
+        let Some((dataset, metric)) = extract_source_info(before) else {
+            return vec![];
+        };
+        vec![CompletionResult::Tag {
             span,
             dataset,
             metric,
-        })
+        }]
     } else if words.len() > 2 {
         if last == "is" {
-            return Some(CompletionResult::Keywords {
+            return vec![CompletionResult::Keywords {
                 span,
                 options: vec![
                     KeywordItem {
@@ -1671,12 +1957,26 @@ fn suggest_filter_context(
                         info: "Boolean type",
                     },
                 ],
-            });
+            }];
         }
         if matches!(last, "==" | "!=" | "<" | ">" | "<=" | ">=") {
-            return suggest_filter_value_params(span, last, params, active_gate);
+            // The comparison RHS is an `expr`: a tag, a param, or a const. The
+            // operator decides whether a regex param is also acceptable.
+            let op = last;
+            return suggest_expr_position(
+                before,
+                span,
+                partial,
+                params,
+                active_gate,
+                |typ| match typ {
+                    ParamType::String | ParamType::Bool | ParamType::Int | ParamType::Float => true,
+                    ParamType::Regex => matches!(op, "==" | "!="),
+                    _ => false,
+                },
+            );
         }
-        Some(CompletionResult::Keywords {
+        vec![CompletionResult::Keywords {
             span,
             options: vec![
                 KeywordItem {
@@ -1695,10 +1995,10 @@ fn suggest_filter_context(
                     info: "Logical NOT",
                 },
             ],
-        })
+        }]
     } else {
         // words.len() == 2: tag name typed, suggest comparison operators
-        Some(CompletionResult::Keywords {
+        vec![CompletionResult::Keywords {
             span,
             options: vec![
                 KeywordItem {
@@ -1737,26 +2037,8 @@ fn suggest_filter_context(
                     info: "Type check",
                 },
             ],
-        })
+        }]
     }
-}
-
-/// Returns param completions for the filter value position (after a comparison
-/// operator). Allows string/bool/int/float params for all operators, and regex
-/// params only for `==` and `!=`. Optional params are gated by `active_gate`
-/// so a `where` outside any `ifdef` never suggests them, and an `ifdef($x)`
-/// body suggests `$x` only — not other optional params.
-fn suggest_filter_value_params(
-    span: Span,
-    op: &str,
-    params: &[ParamItem],
-    active_gate: Option<&str>,
-) -> Option<CompletionResult> {
-    suggest_params(span, params, active_gate, |typ| match typ {
-        ParamType::String | ParamType::Bool | ParamType::Int | ParamType::Float => true,
-        ParamType::Regex => matches!(op, "==" | "!="),
-        _ => false,
-    })
 }
 
 /// Returns `true` when every line in `text` is a preamble construct
@@ -1784,9 +2066,9 @@ fn is_preamble_only(text: &str) -> bool {
 /// - Preamble keyword suggestions (`param`, `set`) when typing a prefix
 /// - Suppression of source completions mid-declaration (`param `, `set `)
 /// - Param type suggestions after `param $name: ` (plain types and valid `Option` wrappers)
-fn suggest_for_preamble(text: &str, partial: &str, span: Span) -> Option<CompletionResult> {
+fn suggest_for_preamble(text: &str, partial: &str, span: Span) -> Vec<CompletionResult> {
     if find_last_pipe(text).is_some() {
-        return None;
+        return vec![];
     }
 
     // Find the current statement: after the last newline or semicolon.
@@ -1798,7 +2080,7 @@ fn suggest_for_preamble(text: &str, partial: &str, span: Span) -> Option<Complet
     let matches_preamble_kw =
         !lower.is_empty() && ["param", "set"].iter().any(|kw| kw.starts_with(&lower));
     if stmt.is_empty() && matches_preamble_kw && is_preamble_position(text) {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![
                 KeywordItem {
@@ -1812,7 +2094,7 @@ fn suggest_for_preamble(text: &str, partial: &str, span: Span) -> Option<Complet
                     info: "Set a query option",
                 },
             ],
-        });
+        }];
     }
 
     // Inside an incomplete `param` declaration
@@ -1823,28 +2105,28 @@ fn suggest_for_preamble(text: &str, partial: &str, span: Span) -> Option<Complet
         if let Some((name, _)) = rest.split_once(':')
             && name.trim().starts_with('$')
         {
-            return Some(CompletionResult::Keywords {
+            return vec![CompletionResult::Keywords {
                 span,
                 options: PARAM_TYPE_KEYWORDS.to_vec(),
-            });
+            }];
         }
 
         // Mid-declaration (e.g. `param `, `param $name`) — suppress source
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![],
-        });
+        }];
     }
 
     // Inside an incomplete `set` directive — suppress source
     if stmt == "set" || stmt.starts_with("set ") {
-        return Some(CompletionResult::Keywords {
+        return vec![CompletionResult::Keywords {
             span,
             options: vec![],
-        });
+        }];
     }
 
-    None
+    vec![]
 }
 
 /// Returns `true` when the text before the current partial consists entirely
@@ -1942,23 +2224,23 @@ fn suggest_for_source(
     partial: &str,
     span: Span,
     params: &[ParamItem],
-) -> Option<CompletionResult> {
+) -> Vec<CompletionResult> {
     // Only at source position — no pipe in the scoped text
     if find_last_pipe(text).is_some() {
-        return None;
+        return vec![];
     }
 
     // When the partial is empty the cursor may still be in the preamble
     // (after param/set/comment lines). Don't suggest Dataset completions
     // there — the user hasn't started typing the source yet.
     if partial.is_empty() && is_preamble_only(text) {
-        return None;
+        return vec![];
     }
 
     if let Some(colon_idx) = partial.find(':') {
         let dataset_raw = &partial[..colon_idx];
         if dataset_raw.is_empty() {
-            return None;
+            return vec![];
         }
         // Metric part after the colon — param mode when it starts with `$`
         let metric_part = &partial[colon_idx + 1..];
@@ -1976,18 +2258,18 @@ fn suggest_for_source(
             .unwrap_or(dataset_raw);
         // Skip past the opening backtick of the metric part if present
         let backtick_offset = usize::from(metric_part.starts_with('`'));
-        Some(CompletionResult::Metric {
+        vec![CompletionResult::Metric {
             span: Span::new(span.from + colon_idx + 1 + backtick_offset, span.to),
             dataset: dataset.to_string(),
-        })
+        }]
     } else if partial.starts_with('$') {
         suggest_params(span, params, None, |t| t == ParamType::Dataset)
     } else {
         // Skip past the opening backtick for unclosed escaped identifiers
         let backtick_offset = usize::from(partial.starts_with('`'));
-        Some(CompletionResult::Dataset {
+        vec![CompletionResult::Dataset {
             span: Span::new(span.from + backtick_offset, span.to),
-        })
+        }]
     }
 }
 

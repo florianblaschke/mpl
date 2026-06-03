@@ -5,8 +5,8 @@ use mpl_lang::STDLIB;
 
 use super::{
     CompletionResult, ParamItem, ParamType, QueryContext, compute_completions,
-    extract_declared_params, extract_partial_word, is_char_escaped, locate_query_context,
-    lookup_function,
+    cursor_in_interpolation, extract_declared_params, extract_partial_word, is_char_escaped,
+    locate_query_context, lookup_function, skip_string_literal,
 };
 
 fn tag_info(r: &CompletionResult) -> Option<(&str, &str)> {
@@ -1056,71 +1056,79 @@ fn completions_backtick_tag_after_multiple_filters_with_escaped_source() {
     assert_eq!(tag_info(&r), Some(("dev.metrics", "metric")),);
 }
 
-// ── filter value position (no completions expected) ─────────────
+// ── filter value position (tag references, never keywords) ──────
 
-/// Bug: After `| filter tag == ` the completion engine returns
-/// `Keywords ["and", "or", "not"]` instead of `None`. The cursor is at the
-/// value position of a comparison — no keyword completions apply here.
+/// After `| filter tag == ` the value position must never offer boolean-op
+/// keywords. It now offers tag references (the RHS is an `expr`), so assert a
+/// Tag completion rather than the historical `None`.
 #[test]
-fn completions_filter_value_position_returns_none() {
+fn completions_filter_value_position_suggests_tag() {
     let query = "ds:metric | filter tag == ";
     let result = compute_completions(query, query.len());
-    assert!(
-        result.is_none(),
-        "expected None at value position after ==, got {:?}",
-        result.as_ref().map(CompletionResult::kind)
+    assert_eq!(
+        result.as_ref().map(CompletionResult::kind),
+        Some("tag"),
+        "expected a tag completion at the value position after =="
     );
 }
 
-/// Same bug with `!=` operator.
+/// Same with the `!=` operator.
 #[test]
-fn completions_filter_value_position_neq_returns_none() {
+fn completions_filter_value_position_neq_suggests_tag() {
     let query = "ds:metric | filter tag != ";
     let result = compute_completions(query, query.len());
-    assert!(
-        result.is_none(),
-        "expected None at value position after !=, got {:?}",
-        result.as_ref().map(CompletionResult::kind)
-    );
+    assert_eq!(result.as_ref().map(CompletionResult::kind), Some("tag"));
 }
 
-/// Same bug with `<` operator.
+/// Same with the `<` operator.
 #[test]
-fn completions_filter_value_position_lt_returns_none() {
+fn completions_filter_value_position_lt_suggests_tag() {
     let query = "ds:metric | filter tag < ";
     let result = compute_completions(query, query.len());
-    assert!(
-        result.is_none(),
-        "expected None at value position after <, got {:?}",
-        result.as_ref().map(CompletionResult::kind)
-    );
+    assert_eq!(result.as_ref().map(CompletionResult::kind), Some("tag"));
 }
 
-/// Same bug with `>=` operator.
+/// Same with the `>=` operator.
 #[test]
-fn completions_filter_value_position_gte_returns_none() {
+fn completions_filter_value_position_gte_suggests_tag() {
     let query = "ds:metric | filter tag >= ";
     let result = compute_completions(query, query.len());
-    assert!(
-        result.is_none(),
-        "expected None at value position after >=, got {:?}",
-        result.as_ref().map(CompletionResult::kind)
-    );
+    assert_eq!(result.as_ref().map(CompletionResult::kind), Some("tag"));
 }
 
-/// Exact reproduction of the reported bug: escaped tag after regex filters.
+/// Leading `//` comment lines (which every example query has) must not break
+/// source extraction. Regression: the commented header was fed into pest's
+/// `source` rule, which does not skip leading comments, so the parse failed and
+/// tag completion silently vanished — the playground showed no tag suggestions.
 #[test]
-fn completions_filter_escaped_tag_value_position_returns_none() {
+fn completions_tag_survives_leading_comments() {
+    for input in [
+        "// a comment\nds:metric | filter #",
+        "// one\n// two\n// three\nds:metric | where foo != #",
+        "// header\nds:metric | group by #",
+    ] {
+        let kinds = completion_kinds_at(input);
+        assert!(
+            kinds.contains(&"tag"),
+            "expected a tag completion for {input:?}, got {kinds:?}"
+        );
+    }
+}
+
+/// An escaped tag after regex filters: the value position resolves the source
+/// (`dev.metrics`:`http_requests_total`) and offers tag completions there.
+#[test]
+fn completions_filter_escaped_tag_value_position_suggests_tag() {
     let query = "\
 `dev.metrics`:http_requests_total\n\
 | filter path == #/.*(elastic\\/_bulk|ingest|(?:v1\\/(traces|logs|metrics))).*/\n\
 | filter code == #/[123]../\n\
 | filter `container` == ";
     let result = compute_completions(query, query.len());
-    assert!(
-        result.is_none(),
-        "expected None at value position after `container` ==, got {:?}",
-        result.as_ref().map(CompletionResult::kind)
+    assert_eq!(
+        result.as_ref().map(CompletionResult::kind),
+        Some("tag"),
+        "expected a tag completion at the value position after `container` =="
     );
 }
 
@@ -1390,10 +1398,12 @@ fn completions_at(input: &str) -> Option<CompletionResult> {
 #[test_case("ds | group using #"                         => Some("group_functions")  ; "dataset no colon group using suggests functions")]
 #[test_case("`my-dataset` | filter #"                    => None                     ; "backtick dataset no colon filter returns none")]
 #[test_case("`my-dataset` | where tag == \"x\" #"        => Some("keywords")         ; "backtick dataset no colon after completed filter")]
-#[test_case("ds:metric | filter tag == #"                => None                     ; "filter value position no params")]
-#[test_case("ds:metric | filter tag != #"                => None                     ; "filter value neq no params")]
-#[test_case("ds:metric | filter tag < #"                 => None                     ; "filter value lt no params")]
-#[test_case("ds:metric | filter tag >= #"                => None                     ; "filter value gte no params")]
+// The comparison RHS is an `expr`, so an empty value position offers tag
+// references (resolved against the source) even with no params declared.
+#[test_case("ds:metric | filter tag == #"                => Some("tag")              ; "filter value position no params")]
+#[test_case("ds:metric | filter tag != #"                => Some("tag")              ; "filter value neq no params")]
+#[test_case("ds:metric | filter tag < #"                 => Some("tag")              ; "filter value lt no params")]
+#[test_case("ds:metric | filter tag >= #"                => Some("tag")              ; "filter value gte no params")]
 #[test_case("ds:metric | filter tag == \"value\" #"      => Some("keywords")         ; "after completed string filter")]
 #[test_case("ds:metric | filter tag == /abc/ #"          => Some("keywords")         ; "after completed regex filter")]
 #[test_case("ds:metric | filter tag > 42 #"              => Some("keywords")         ; "after completed numeric filter")]
@@ -1443,8 +1453,8 @@ fn completions_at(input: &str) -> Option<CompletionResult> {
 #[test_case("ds:metric | bucket using #"                => Some("bucket_functions") ; "bucket using suggests functions")]
 #[test_case("param $w: duration;\nds:metric | bucket to #" => Some("params")         ; "bucket to with duration param")]
 #[test_case("param $s: string;\nds:metric | align to #"  => None                     ; "align to no duration params")]
-#[test_case("ds:metric | filter tag == #"                => None                     ; "filter value no params returns none")]
-#[test_case("ds:metric | where tag == #"                 => None                     ; "where value no params returns none")]
+#[test_case("ds:metric | filter tag == #"                => Some("tag")              ; "filter value no params offers tags")]
+#[test_case("ds:metric | where tag == #"                 => Some("tag")              ; "where value no params offers tags")]
 #[test_case("`dev.metrics`:http_requests_total\n| align #" => Some("keywords") ; "align initial kind")]
 #[test_case("`dev.metrics`:http_requests_total\n| align to 42s #" => Some("keywords") ; "align after to kind")]
 #[test_case("ds:metric | align to 42s over 1h #"        => Some("keywords")         ; "align after to over kind")]
@@ -1497,13 +1507,38 @@ fn completions_at(input: &str) -> Option<CompletionResult> {
 // ── extend ─────────────────────────────────────────────────
 #[test_case("ds:metric | extend #"                                  => None             ; "extend bare expects ident no completions")]
 #[test_case("ds:metric | extend foo #"                              => Some("keywords") ; "extend ident suggests equals")]
-#[test_case("ds:metric | extend foo = #"                            => None             ; "extend value with no params returns none")]
+// The extend value is an `expr`: an empty position offers tag references when
+// no param fits; a non-scalar (regex) param is still never offered.
+#[test_case("ds:metric | extend foo = #"                            => Some("tag")      ; "extend value with no params offers tags")]
 #[test_case("param $s: string;\nds:metric | extend foo = #"        => Some("params")   ; "extend value with string param suggests params")]
-#[test_case("param $r: Regex;\nds:metric | extend foo = #"         => None             ; "extend value excludes regex params")]
+#[test_case("param $r: Regex;\nds:metric | extend foo = #"         => Some("tag")      ; "extend value falls back to tags excluding regex param")]
 #[test_case("ds:metric | extend foo = \"x\" #"                    => Some("keywords") ; "extend complete suggests comma continuation")]
 #[test_case("ds:metric | extend foo = \"x\", #"                   => None             ; "extend after comma free-form ident")]
 // ── extend in compute tail ─────────────────────────────────────────
 #[test_case("( a:b , c:d ) | compute r using / | extend foo #"     => Some("keywords") ; "extend in compute tail also suggests equals")]
+// ── string interpolation ───────────────────────────────────────────
+#[test_case("param $h: string;\nds:metric | where tag == \"host ${ #\""        => Some("params")  ; "interpolation empty suggests params")]
+#[test_case("param $h: string;\nds:metric | where tag == \"host ${ $#\""       => Some("params")  ; "interpolation dollar suggests params")]
+#[test_case("param $h: string;\nds:metric | where tag == \"host ${ $h#\""      => Some("params")  ; "interpolation partial param suggests params")]
+#[test_case("param $h: string;\nds:metric | extend url = \"x${ $#\""           => Some("params")  ; "interpolation in extend value suggests params")]
+#[test_case("param $h: string;\nds:metric | where tag == \"a ${ \"b ${ $#\""   => Some("params")  ; "nested interpolation suggests params")]
+#[test_case("param $h: string;\nds:metric | where tag == \"p ${ 4#\""          => None            ; "interpolation const literal partial offers nothing")]
+#[test_case("ds:metric | where tag == \"host ${ $#\""                          => None            ; "interpolation with no params returns none")]
+// A query whose string contains a nested-string interpolation must not confuse
+// the pipe/context scanner: the next pipe still offers pipe keywords.
+#[test_case("param $h: string;\nds:metric | where tag == \"a ${ \"b\" } c\" | #" => Some("keywords") ; "pipe after nested-string interpolation still suggests keywords")]
+// An escaped backtick inside an escaped identifier must not break the scanner.
+#[test_case("`a\\`b`:metric | #"                                              => Some("keywords") ; "pipe after escaped-backtick dataset suggests keywords")]
+// ── tag references in expression positions ──────────────────────────
+// A tag is now a legal `expr`, so expr positions complete tags. `$` still
+// requests params; a const literal partial still completes nothing.
+#[test_case("ds:metric | where tag == bar#"                                  => Some("tag")     ; "filter value bare ident suggests tag")]
+#[test_case("ds:metric | where tag == `weird#"                               => Some("tag")     ; "filter value backtick ident suggests tag")]
+#[test_case("param $s: string;\nds:metric | where tag == $#"                 => Some("params")  ; "filter value dollar still suggests params")]
+#[test_case("ds:metric | extend foo = bar#"                                  => Some("tag")     ; "extend value bare ident suggests tag")]
+#[test_case("ds:metric | where tag == \"host ${ id#\""                       => Some("tag")     ; "interpolation bare ident suggests tag")]
+#[test_case("ds:metric | where tag == \"host ${ #\""                         => Some("tag")     ; "interpolation empty no params suggests tag")]
+#[test_case("ds:metric | where tag == 4#"                                    => None            ; "filter value numeric literal offers nothing")]
 fn test_completion_kind(input: &str) -> Option<&'static str> {
     completions_at(input).map(|r| r.kind())
 }
@@ -1550,6 +1585,9 @@ fn test_completion_kind(input: &str) -> Option<&'static str> {
 #[test_case("ds:metric | where tag is #",                  &["string", "int", "float", "bool"] ; "is suggests all tag types")]
 #[test_case("ds:metric | where tag is string #",           &["and", "or", "not"]      ; "after is string suggests boolean ops")]
 #[test_case("ds:metric | filter tag is bool #",            &["and", "or"]             ; "after is bool suggests boolean ops")]
+// ── string interpolation ────────────────────────────────────────
+#[test_case("param $host: string;\nparam $env: string;\nds:metric | where tag == \"h ${ $#\"", &["$host", "$env"] ; "interpolation suggests all declared params")]
+#[test_case("param $host: string;\nparam $env: string;\nds:metric | where tag == \"h ${ $ho#\"", &["$host"] ; "interpolation filters params by partial")]
 fn test_completion_labels_contain(input: &str, expected: &[&str]) {
     let r = completions_at(input).expect("should produce completions");
     let labels = r.option_labels();
@@ -1753,11 +1791,95 @@ use super::compute_completions_with_params;
 /// Variant of `completions_at` that splices in host-supplied system params,
 /// mirroring what the wasm bridge does after decoding the JS payload.
 fn completions_at_with_params(input: &str, extra: &[ParamItem]) -> Option<CompletionResult> {
+    all_completions_at_with_params(input, extra)
+        .into_iter()
+        .next()
+}
+
+/// Like `completions_at_with_params`, but returns every result so tests can
+/// assert that an empty `expr` position offers both params and tags.
+fn all_completions_at_with_params(input: &str, extra: &[ParamItem]) -> Vec<CompletionResult> {
     let cursor = input
         .find('#')
         .expect("input must contain a # cursor marker");
     let query = format!("{}{}", &input[..cursor], &input[cursor + 1..]);
     compute_completions_with_params(&query, cursor, extra)
+}
+
+/// Returns the ordered list of completion result kinds at the cursor (no
+/// system params). Used to assert that an empty `expr` position yields both a
+/// `params` and a `tag` result.
+fn completion_kinds_at(input: &str) -> Vec<&'static str> {
+    all_completions_at_with_params(input, &[])
+        .iter()
+        .map(CompletionResult::kind)
+        .collect()
+}
+
+#[test]
+fn empty_interpolation_with_param_offers_both_params_and_tag() {
+    // The bug this guards: a declared (or host-injected) param must not hide
+    // tag completion inside `${ }`. Both must be offered so the editor's own
+    // prefix filter can separate `$param` from bare tag names.
+    let kinds = completion_kinds_at("param $h: string;\nds:metric | where tag == \"host ${ #\"");
+    assert_eq!(kinds, vec!["params", "tag"]);
+}
+
+#[test]
+fn system_param_does_not_hide_tag_in_interpolation() {
+    // A host-injected system param (e.g. `$__interval`) is always in scope, so
+    // it previously masked tag completion at every empty `${ }` position.
+    let input = "ds:metric | where code == \"${ #\"";
+    let kinds: Vec<&str> = all_completions_at_with_params(input, &[duration_param("$__interval")])
+        .iter()
+        .map(CompletionResult::kind)
+        .collect();
+    assert_eq!(kinds, vec!["params", "tag"]);
+}
+
+#[test]
+fn empty_filter_value_with_param_offers_both() {
+    let kinds = completion_kinds_at("param $s: string;\nds:metric | where tag == #");
+    assert_eq!(kinds, vec!["params", "tag"]);
+}
+
+#[test]
+fn empty_extend_value_with_param_offers_both() {
+    let kinds = completion_kinds_at("param $s: string;\nds:metric | extend foo = #");
+    assert_eq!(kinds, vec!["params", "tag"]);
+}
+
+#[test]
+fn empty_interpolation_without_params_offers_only_tag() {
+    let kinds = completion_kinds_at("ds:metric | where tag == \"host ${ #\"");
+    assert_eq!(kinds, vec!["tag"]);
+}
+
+#[test]
+fn dollar_in_interpolation_offers_only_params() {
+    let kinds = completion_kinds_at("param $h: string;\nds:metric | where tag == \"host ${ $#\"");
+    assert_eq!(kinds, vec!["params"]);
+}
+
+#[test]
+fn bare_ident_in_interpolation_offers_only_tag() {
+    let kinds = completion_kinds_at("param $h: string;\nds:metric | where tag == \"host ${ id#\"");
+    assert_eq!(kinds, vec!["tag"]);
+}
+
+#[test]
+fn inside_plain_string_literal_offers_nothing() {
+    // A `"…"` value on the RHS of a comparison is a `const`; the cursor inside
+    // it must not complete anything. Regression: the unterminated leading `"`
+    // was mis-read as a bare token and the dispatcher suggested and/or/not.
+    assert!(completion_kinds_at("ds:metric | where tag == \"#").is_empty());
+    assert!(completion_kinds_at("ds:metric | where tag == \"#\"").is_empty());
+    assert!(completion_kinds_at("ds:metric | where tag == \"ab#\"").is_empty());
+    // But after the closed string, boolean operators are still offered.
+    assert_eq!(
+        completions_at("ds:metric | where tag == \"x\" #").map(|r| r.kind()),
+        Some("keywords")
+    );
 }
 
 fn duration_param(name: &str) -> ParamItem {
@@ -1827,4 +1949,69 @@ fn inline_decl_shadows_system_param_with_same_name() {
         count, 1,
         "inline decl + system param with same name must yield exactly one entry, got: {labels:?}"
     );
+}
+
+// ── interpolation-aware byte scanners ───────────────────────────
+// White-box tests for the escape/comment/EOF edge branches that are hard to
+// drive deterministically through `compute_completions`.
+
+#[test]
+fn skip_string_literal_handles_escapes_and_nested_interpolation() {
+    // Escaped quote stays inside the string; a `${ "c" }` interpolation with a
+    // nested string is skipped as a unit. `*i` must land on the final quote.
+    let src = r#""a\" b ${ "c" } d" rest"#;
+    let mut i = 0;
+    skip_string_literal(src.as_bytes(), src.len(), &mut i);
+    assert_eq!(src.as_bytes()[i], b'"');
+    assert_eq!(&src[..=i], r#""a\" b ${ "c" } d""#);
+    assert_eq!(&src[i + 1..], " rest");
+}
+
+#[test]
+fn skip_string_literal_skips_backtick_ident_in_interpolation() {
+    // A `}` (and an escaped backtick `\``) inside a backtick identifier must
+    // not close the interpolation or the identifier prematurely.
+    let src = r#""x ${ $`a\`}b` } y" rest"#;
+    let mut i = 0;
+    skip_string_literal(src.as_bytes(), src.len(), &mut i);
+    assert_eq!(&src[..=i], r#""x ${ $`a\`}b` } y""#);
+    assert_eq!(&src[i + 1..], " rest");
+}
+
+#[test]
+fn skip_string_literal_clamps_on_trailing_backslash() {
+    // Unterminated string ending in a backslash must not run `*i` past `len`.
+    let src = r#""ab\"#;
+    let mut i = 0;
+    skip_string_literal(src.as_bytes(), src.len(), &mut i);
+    assert_eq!(i, src.len());
+}
+
+#[test]
+fn cursor_in_interpolation_true_cases() {
+    // Escaped char in the string text before the interpolation.
+    let q = "x == \"a\\nb ${ ";
+    assert!(cursor_in_interpolation(q, q.len()));
+    // A `//` comment in code before the string is skipped.
+    let q = "ds // note\n| x == \"${ ";
+    assert!(cursor_in_interpolation(q, q.len()));
+    // A backtick identifier in code does not open a string.
+    let q = "`a b`:m | x == \"${ ";
+    assert!(cursor_in_interpolation(q, q.len()));
+    // Nested interpolation: innermost `${` is interpolation code.
+    let q = "x == \"a ${ \"b ${ ";
+    assert!(cursor_in_interpolation(q, q.len()));
+}
+
+#[test]
+fn cursor_in_interpolation_false_cases() {
+    // Plain string text is not interpolation.
+    let q = "x == \"abc";
+    assert!(!cursor_in_interpolation(q, q.len()));
+    // Ordinary query code is not interpolation.
+    let q = "ds:metric | where ";
+    assert!(!cursor_in_interpolation(q, q.len()));
+    // After the interpolation closes, the trailing string text is not code.
+    let q = "x == \"a ${ $h } b";
+    assert!(!cursor_in_interpolation(q, q.len()));
 }

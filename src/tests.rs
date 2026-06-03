@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     CompileError, ParseError, TypeError,
-    query::{Cmp, Expr, Filter, TagType, TerminalParamType},
+    query::{Cmp, DirectiveValue, Expr, Filter, TagType, TerminalParamType},
 };
 
 #[test]
@@ -184,6 +184,54 @@ dataset:metric
         crate::Query::Simple { filters, .. } => {
             assert_eq!(1, filters.len());
             assert_eq!(&expected, filters[0].filter());
+        }
+        crate::Query::Compute { .. } => panic!("not a simple query"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn parse_idents() -> Result<(), Box<dyn std::error::Error>> {
+    let s = r"
+dataset:metric
+| where tag == infra
+| where tag2 == trueish
+| where tag3 == falseish
+| where tag4 == inf|where tag5==true|where tag6==false";
+    let (res, _) = super::compile(s, HashMap::new())?;
+    let expected = [
+        Filter::Cmp {
+            field: "tag".into(),
+            rhs: Cmp::Eq(Expr::Tag("infra".to_string())),
+        },
+        Filter::Cmp {
+            field: "tag2".into(),
+            rhs: Cmp::Eq(Expr::Tag("trueish".to_string())),
+        },
+        Filter::Cmp {
+            field: "tag3".into(),
+            rhs: Cmp::Eq(Expr::Tag("falseish".to_string())),
+        },
+        Filter::Cmp {
+            field: "tag4".into(),
+            rhs: Cmp::Eq(Expr::Const(f64::INFINITY.into())),
+        },
+        Filter::Cmp {
+            field: "tag5".into(),
+            rhs: Cmp::Eq(Expr::Const(true.into())),
+        },
+        Filter::Cmp {
+            field: "tag6".into(),
+            rhs: Cmp::Eq(Expr::Const(false.into())),
+        },
+    ];
+    match res {
+        crate::Query::Simple { filters, .. } => {
+            assert_eq!(6, filters.len());
+            for (i, filter) in filters.iter().enumerate() {
+                assert_eq!(&expected[i], filter.filter());
+            }
         }
         crate::Query::Compute { .. } => panic!("not a simple query"),
     }
@@ -423,5 +471,49 @@ fn group_by_compute() -> Result<(), Box<dyn std::error::Error>> {
 | compute test using +
     ";
     super::compile(s, HashMap::new())?;
+    Ok(())
+}
+
+#[test]
+fn directive_string() -> Result<(), Box<dyn std::error::Error>> {
+    let (query, _warnings) = super::compile("set foo = \"bar\";\ndataset:metric", HashMap::new())?;
+    assert_eq!(
+        query.directives().get("foo"),
+        Some(&DirectiveValue::String("bar".to_string()))
+    );
+    Ok(())
+}
+
+#[test]
+fn interp_display() -> Result<(), Box<dyn std::error::Error>> {
+    let src = r#"param $host: string;
+dataset:metric
+| extend url = "http://${ $host }:${ 8080 }""#;
+    let (query, _warnings) = super::compile(src, HashMap::new())?;
+    let printed = query.to_string();
+    super::compile(&printed, HashMap::new())
+        .unwrap_or_else(|e| panic!("printed query did not re-parse: {e}\nprinted:\n{printed}"));
+    Ok(())
+}
+
+#[test]
+fn tag_expr_display() -> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        "dataset:metric\n| where foo == bar",
+        "dataset:metric\n| extend x = some_tag",
+        "dataset:metric\n| extend x = `weird tag`",
+        "dataset:metric\n| where foo == `weird-tag`",
+        "dataset:metric\n| extend url = \"http://${ id }\"",
+    ];
+    for src in cases {
+        let (query, _warnings) = super::compile(src, HashMap::new())?;
+        let printed = query.to_string();
+        let (reparsed, _warnings) = super::compile(&printed, HashMap::new())?;
+        assert_eq!(
+            printed,
+            reparsed.to_string(),
+            "round-trip unstable for {src:?} vs {printed:?}"
+        );
+    }
     Ok(())
 }
