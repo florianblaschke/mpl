@@ -134,9 +134,16 @@ expr = { const | param_ident | ident }
 
 const = { string | float | int | bool | inf }
 
-align = { "align" ~ ("to" ~ time_relative_parameterized)? ~ ("over" ~ time_relative_parameterized)? ~ "using" ~ func }
+kw_to = { "to" }
+kw_over = { "over" }
+kw_using = { "using" }
+kw_align = { "align" }
+kw_by = { "by" }
+kw_group = { "group" }
 
-group_by = { "group" ~ ("by" ~ tags)? ~ "using" ~ func }
+align = { kw_align ~ (kw_to ~ time_relative_parameterized)? ~ (kw_over ~ time_relative_parameterized)? ~ kw_using ~ func }
+
+group_by = { kw_group ~ (kw_by ~ tags)? ~ kw_using ~ func }
 
 replace_tag        = { tag ~ "~" ~ regex_replace }
 replace_rename     = { tag ~ "=" ~ tag }
