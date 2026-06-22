@@ -51,7 +51,7 @@ impl Span {
 pub fn query_spec() -> String {
     use std::fmt::Write;
 
-    use mpl_lang::stdlib::STDLIB;
+    use mpl_lang::STDLIB;
 
     let stdlib_docs = STDLIB
         .documentation(1)
