@@ -16,7 +16,7 @@ pub mod enc_regex;
 pub mod errors;
 pub mod linker;
 pub mod query;
-pub mod stdlib;
+mod stdlib;
 pub mod tags;
 pub mod time;
 pub mod types;
