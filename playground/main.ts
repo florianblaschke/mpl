@@ -1,12 +1,12 @@
 // Alpine.js store — glues editor, pipeline, and UI together.
 
-import wasmInitLanguageServer from "@axiomhq/mpl";
+import wasmInitLanguageServer, { declared_params } from "@axiomhq/mpl";
 import wasmInitPlayground, { Interpreter, RunOutput } from "@axiomhq/mpl-playground";
 import Alpine from "alpinejs";
 import { renderCharts, type ChartEntry } from "./charts";
 import { datasets } from "./datasets";
 import { createEditor, substituteSystemParams, type EditorInstance } from "./editor";
-import { MplSystemParam, ParamDecl, parseParamDeclarations } from "@axiomhq/mpl-codemirror";
+import { MplSystemParam } from "@axiomhq/mpl-codemirror";
 import { substituteParams } from "./params";
 
 const exampleModules = import.meta.glob("./examples/*.mpl", {
@@ -58,7 +58,7 @@ function onEditorChange() {
   // otherwise bail on every `Parameterized::Param` node; the editor still
   // sees the original text (with the param reference) for linting and
   // hover, courtesy of the `mplSystemParams` facet.
-  const decls = parseParamDeclarations(doc);
+  const decls: MplSystemParam[] = declared_params(doc);
   syncParams(decls);
   const resolved = substituteParams(substituteSystemParams(doc), decls, paramValues);
   let steps: RunOutput;
@@ -179,18 +179,14 @@ const playgroundStore = {
   },
 };
 
-function syncParams(decls: Map<string, ParamDecl>) {
-  const live = new Set(decls.keys());
+function syncParams(decls: MplSystemParam[]) {
+  const live = new Set(decls.map(p => p.name));
   for (const name of Object.keys(paramValues)) {
     if (!live.has(name)) delete paramValues[name];
   }
 
   const store = Alpine.store("playground") as typeof playgroundStore;
-  const params: MplSystemParam[] = [];
-  for (const [name, { type, optional }] of decls.entries()) {
-    params.push({ name, type, optional });
-  }
-  store.params = params;
+  store.params = decls;
 }
 
 Alpine.store("playground", playgroundStore);

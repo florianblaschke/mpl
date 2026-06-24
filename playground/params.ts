@@ -1,4 +1,4 @@
-import { MplParamType, ParamDecl } from "@axiomhq/mpl-codemirror";
+import { MplParamType, MplSystemParam } from "@axiomhq/mpl-codemirror";
 
 /**
  * Formats a raw user input into the MPL atomic literal its type expects.
@@ -25,7 +25,7 @@ export function formatValue(type: MplParamType, raw: string): string {
 */
 export function substituteParams(
   doc: string,
-  decls: Map<string, ParamDecl>,
+  decls: MplSystemParam[],
   values: Record<string, string>,
 ): string {
   return doc
@@ -34,12 +34,12 @@ export function substituteParams(
       // Skip declaration lines
       if (/^\s*param\s+\$/.test(line)) return line;
       let out = line;
-      for (const [name, decl] of decls.entries()) {
-        const raw = values[name];
-        if (!raw || decl.optional) continue;
+      for (const param of decls) {
+        const raw = values[param.name];
+        if (!raw || param.optional) continue;
 
-        const ref = new RegExp(`\\${name}\\b`, "g");
-        out = out.replace(ref, formatValue(decl.type, raw));
+        const ref = new RegExp(`\\$${param.name}\\b`, "g");
+        out = out.replace(ref, formatValue(param.type, raw));
       }
       return out;
     })
